@@ -1,5 +1,13 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionsBitField } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  SlashCommandBuilder,
+  EmbedBuilder,
+  PermissionsBitField
+} = require('discord.js');
 const express = require('express');
 const fs = require('fs-extra');
 const app = express();
@@ -32,30 +40,23 @@ function generateKey() {
   return key;
 }
 
-// Cooldown tracking for /resetroblox per user
-const resetCooldownMs = 24 * 60 * 60 * 1000; // 1 day cooldown
-
-// Express API for validating keys
+// --- API Endpoint ---
 app.get('/validate', async (req, res) => {
-  const { key, robloxId, robloxUsername } = req.query;
-  if (!key || !robloxId || !robloxUsername) return res.status(400).send('Missing parameters');
+  const { key, hwid } = req.query;
+  if (!key || !hwid) return res.status(400).send('Missing parameters');
 
   await loadKeys();
   const entry = Object.values(issuedKeys).find(k => k.key === key);
-
   if (!entry) return res.status(403).send('Invalid');
   if (Date.now() > new Date(entry.expiresAt).getTime()) return res.status(403).send('Expired');
-  if (entry.usageLeft <= 0) return res.status(403).send('Used');
 
-  if (!entry.robloxId) {
-    // First time claim — lock key to roblox user
-    entry.robloxId = robloxId;
-    entry.robloxUsername = robloxUsername;
-  } else if (entry.robloxId !== robloxId) {
-    return res.status(403).send('BoundToAnotherUser');
+  // HWID Check
+  if (!entry.hwid) {
+    entry.hwid = hwid;
+  } else if (entry.hwid !== hwid) {
+    return res.status(403).send('BoundToAnotherHWID');
   }
 
-  entry.usageLeft -= 1;
   await saveKeys();
   return res.send('Valid');
 });
@@ -74,124 +75,119 @@ client.once('ready', async () => {
 const rest = new REST({ version: '10' }).setToken(TOKEN);
 
 const commands = [
-  new SlashCommandBuilder()
-    .setName('genkey')
-    .setDescription('Generate a new key'),
+  new SlashCommandBuilder().setName('genkey').setDescription('Generate a new HWID key'),
   new SlashCommandBuilder()
     .setName('revoke')
     .setDescription('Revoke a key')
     .addStringOption(opt => opt.setName('key').setDescription('Key to revoke').setRequired(true)),
+  new SlashCommandBuilder().setName('listkeys').setDescription('List all keys'),
   new SlashCommandBuilder()
-    .setName('listkeys')
-    .setDescription('List all issued keys'),
-  new SlashCommandBuilder()
-    .setName('resetroblox')
-    .setDescription('Reset Roblox account linked to your key')
+    .setName('resethwid')
+    .setDescription('Reset HWID of a key')
     .addStringOption(opt => opt.setName('key').setDescription('Your key').setRequired(true))
 ];
 
 async function registerCommands() {
-  try {
-    const appId = (await client.application.fetch()).id;
-    await rest.put(Routes.applicationGuildCommands(appId, GUILD_ID), {
-      body: commands.map(cmd => cmd.toJSON())
-    });
-    console.log('✅ Slash commands registered.');
-  } catch (e) {
-    console.error('❌ Command registration failed:', e);
-  }
+  const appId = (await client.application.fetch()).id;
+  await rest.put(Routes.applicationGuildCommands(appId, GUILD_ID), {
+    body: commands.map(c => c.toJSON())
+  });
+  console.log('✅ Slash commands registered.');
 }
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
-
   const { commandName, user } = interaction;
-
   await loadKeys();
 
+  // --- /genkey ---
   if (commandName === 'genkey') {
-    // Only allow admin
     if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '❌ You are not allowed to generate keys.', ephemeral: true });
+      return interaction.reply({ content: '❌ No permission.', ephemeral: true });
     }
 
     const key = generateKey();
     issuedKeys[key] = {
       key,
-      usageLeft: 1,
       createdAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(), // 3 days
-      robloxId: null,
-      robloxUsername: null,
-      discordId: null,
+      expiresAt: new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString(),
+      hwid: null,
       lastReset: null
     };
+
     await saveKeys();
-    return interaction.reply({ content: `🔑 Key generated: \`${key}\` (Expires in 3 days, 1 use)`, ephemeral: true });
+
+    const embed = new EmbedBuilder()
+      .setTitle('🔑 Key Generated')
+      .addFields(
+        { name: 'Key', value: `\`${key}\`` },
+        { name: 'Expires', value: '3 days' },
+        { name: 'Usage', value: '∞ (unlimited)' }
+      )
+      .setColor(0x57F287)
+      .setTimestamp();
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
+  // --- /revoke ---
   if (commandName === 'revoke') {
-    // Only admin
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '❌ You are not allowed to revoke keys.', ephemeral: true });
+    const key = interaction.options.getString('key');
+    if (!issuedKeys[key]) {
+      return interaction.reply({ content: '❌ Key not found.', ephemeral: true });
     }
-    const key = interaction.options.getString('key').toUpperCase();
-    if (!issuedKeys[key]) return interaction.reply({ content: '⚠️ Key not found.', ephemeral: true });
-
     delete issuedKeys[key];
     await saveKeys();
-    return interaction.reply({ content: `❌ Key \`${key}\` revoked.`, ephemeral: true });
+
+    const embed = new EmbedBuilder()
+      .setTitle('🗑️ Key Revoked')
+      .setDescription(`\`${key}\` has been removed.`)
+      .setColor(0xED4245);
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
+  // --- /listkeys ---
   if (commandName === 'listkeys') {
-    // Only admin
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      return interaction.reply({ content: '❌ You are not allowed to list keys.', ephemeral: true });
+    const entries = Object.values(issuedKeys);
+    if (entries.length === 0) {
+      return interaction.reply({ content: 'No keys available.', ephemeral: true });
     }
-    let text = '';
-    for (const key in issuedKeys) {
-      const k = issuedKeys[key];
-      text += `\`${k.key}\` → Roblox: \`${k.robloxUsername ?? 'Unclaimed'}\` (ID: \`${k.robloxId ?? 'N/A'}\`) | Discord: \`${k.discordId ?? 'N/A'}\` | Uses left: ${k.usageLeft} | Expires: ${new Date(k.expiresAt).toLocaleString()}\n`;
-    }
-    if (text.length === 0) text = 'No keys issued yet.';
-    return interaction.reply({ content: text, ephemeral: true });
+
+    const embed = new EmbedBuilder()
+      .setTitle('🧾 Issued Keys')
+      .setDescription(
+        entries.map(k =>
+          `\`${k.key}\` | Expires: <t:${Math.floor(new Date(k.expiresAt).getTime() / 1000)}:R> | HWID: ${k.hwid ? '✅' : '❌'}`
+        ).join('\n')
+      )
+      .setColor(0x3498DB);
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 
-  if (commandName === 'resetroblox') {
-    const key = interaction.options.getString('key').toUpperCase();
+  // --- /resethwid ---
+  if (commandName === 'resethwid') {
+    const key = interaction.options.getString('key');
+    const entry = issuedKeys[key];
 
-    if (!issuedKeys[key]) {
-      return interaction.reply({ content: '⚠️ Key not found.', ephemeral: true });
-    }
-
-    const k = issuedKeys[key];
-
-    if (k.discordId && k.discordId !== user.id) {
-      return interaction.reply({ content: '❌ This key was not redeemed by your Discord account.', ephemeral: true });
-    }
+    if (!entry) return interaction.reply({ content: '❌ Key not found.', ephemeral: true });
 
     const now = Date.now();
-
-    // Admins skip cooldown
-    const isAdmin = interaction.member.permissions.has(PermissionsBitField.Flags.Administrator);
-
-    if (!isAdmin && k.lastReset) {
-      const lastReset = new Date(k.lastReset).getTime();
-      if (now - lastReset < resetCooldownMs) {
-        const left = Math.ceil((resetCooldownMs - (now - lastReset)) / (1000 * 60)); // minutes left
-        return interaction.reply({ content: `⏳ You must wait ${left} more minutes before resetting Roblox account again.`, ephemeral: true });
-      }
+    if (entry.lastReset && now - new Date(entry.lastReset).getTime() < 12 * 60 * 60 * 1000) {
+      return interaction.reply({ content: '⏳ You can only reset HWID once every 12 hours.', ephemeral: true });
     }
 
-    // Reset Roblox data but keep Discord ID locked (so only that Discord user can reset it)
-    k.robloxId = null;
-    k.robloxUsername = null;
-    k.lastReset = new Date().toISOString();
-    // Also mark the discordId if not set yet
-    if (!k.discordId) k.discordId = user.id;
-
+    entry.hwid = null;
+    entry.lastReset = new Date().toISOString();
     await saveKeys();
-    return interaction.reply({ content: '✅ Roblox account linked to your key has been reset. You can now claim it again.', ephemeral: true });
+
+    const embed = new EmbedBuilder()
+      .setTitle('♻️ HWID Reset')
+      .setDescription(`HWID for \`${key}\` has been cleared.`)
+      .setColor(0xF1C40F);
+
+    return interaction.reply({ embeds: [embed], ephemeral: true });
   }
 });
 
